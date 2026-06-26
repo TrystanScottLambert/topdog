@@ -2,6 +2,11 @@
 name = "topdog"
 version = "0.0.1"
 edition = "2024"
+readme = "README.md"
+description = "Modern replacement for topcat"
+authors = ["Trystan Lambert <trystan.lambert@uwa.edu.au>"]
+license = "MIT"
+repository = "https://github.com/TrystanScottLambert/topdog"
 
 [dependencies]
 eframe = "0.35.0"
