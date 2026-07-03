@@ -10,5 +10,6 @@ repository = "https://github.com/TrystanScottLambert/topdog"
 
 [dependencies]
 eframe = "0.35.0"
-polars = "0.54.4"
+iced = "0.14.0"
+polars = { version = "0.54.4", features = ["lazy", "parquet", "strings"] }
 rfd = "0.17.2"
