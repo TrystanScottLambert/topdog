@@ -18,3 +18,10 @@ topdog-plot = { workspace = true }
 iced = { workspace = true }
 rfd = { workspace = true }
 anyhow = { workspace = true }
+# PNG export: rasterizes the SVG produced by the shared Surface renderer,
+# so raster output cannot drift from screen/vector output.
+resvg = "0.45"
+
+[dev-dependencies]
+# Building in-memory DataTables for tests of the Python generator.
+polars = { workspace = true }

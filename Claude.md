@@ -105,7 +105,11 @@ The `topdog-gui` binary is the product; `topdog-cli` is a convenience for testin
 - **Row-selection subsets.** `fetch_window` threads a stable row-index column (`__topdog_row__`) through filter/sort, so clicking rows in the Tables tab selects base-row identities; `DataTable::subset_from_rows` (polars `is_in`) turns a selection into a subset. Subsets can also project a chosen column list.
 - **Sphere plots.** `PlotKind::Sphere` scatters lon/lat on a wireframe unit sphere (TOPCAT-style), or at true 3D positions when a distance column is given (r normalized to the max distance); far-hemisphere points are alpha-faded. Shares the 3D camera interaction.
 - **3D camera state** (yaw/pitch/zoom/pan) lives in the GUI pane, not `PlotSpec` — orientation is interaction state, not figure appearance.
-- **Plots draw on white regardless of app theme** so the on-screen figure matches the future exported (paper) version.
+- **Plots draw on white regardless of app theme** so the on-screen figure matches the exported (paper) version.
+- **One renderer, two backends.** All plot drawing goes through the `Surface` trait in `topdog-gui/src/plot.rs`, implemented for iced's canvas `Frame` (screen) and `SvgSurface` (export). There is deliberately no second rendering path: PNG export rasterizes the *same* SVG via `resvg` at 3× (≈300 dpi), so screen, SVG, and PNG cannot drift apart. Any new plot element must be drawn with `Surface` methods, never `Frame` directly.
+- **Axes styling** follows journal convention: mirrored inward ticks on all four sides, legend in a bordered box, tick length/width and all font sizes editable from the plot tab's Figure section.
+- **Region selection.** Dragging a rectangle on any cartesian plot (scatter/line/histogram) creates a subset of that layer's source table via a `BETWEEN` predicate on the plotted columns — so the subset keeps every column, not just the plotted ones. Not offered for sky/sphere/3D, where drag already means rotate.
+- **Python export is the STILTS replacement** (CLAUDE.md §1 philosophy 7). Each `LoadedTable` remembers its file path and each subset carries a `lineage: Vec<LineageStep>` (filter / column projection / picked row indices). The Python button writes a standalone polars + matplotlib script that re-scans the original parquet, replays the lineage, and redraws the layers with matching styles. Keep lineage tracking intact when adding new subset-creation paths, or generated scripts silently lose provenance.
 
 ## 6. Suggested build order (phases)
 

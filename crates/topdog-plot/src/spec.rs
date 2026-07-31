@@ -218,6 +218,10 @@ pub struct PlotSpec {
     pub title_size: f32,
     pub label_size: f32,
     pub tick_label_size: f32,
+    /// Length of (inward) tick marks, px.
+    pub tick_length: f32,
+    /// Stroke width of tick marks and the axes frame, px.
+    pub tick_width: f32,
 }
 
 impl PlotSpec {
@@ -359,6 +363,8 @@ impl PlotSpec {
             title_size: 18.0,
             label_size: 15.0,
             tick_label_size: 12.0,
+            tick_length: 5.0,
+            tick_width: 1.0,
         }
     }
 }
