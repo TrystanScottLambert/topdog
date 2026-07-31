@@ -25,6 +25,7 @@ polars = { version = "0.54.4", features = [
     "log",          # Expr::log for log-binned histograms
     "round_series", # Expr::floor/clip for histogram bin indices
     "sql",          # sql_expr: parse user-typed subset predicates
+    "is_in",        # Expr::is_in for row-selection subsets
 ] }
 thiserror = "2"
 anyhow = "1"

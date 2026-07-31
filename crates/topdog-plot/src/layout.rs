@@ -245,21 +245,12 @@ mod tests {
 
     #[test]
     fn legend_appears_with_two_layers_and_is_editable() {
-        use crate::spec::{LayerStyle, Rgba};
+        use crate::spec::LayerStyle;
         let mut s = spec();
         let l = PlotLayout::compute(&s, 800.0, 600.0);
         assert!(l.legend_labels.is_empty()); // single layer: no legend
 
-        s.layers = vec![
-            LayerStyle {
-                label: "bright".into(),
-                color: Rgba::layer_color(0),
-            },
-            LayerStyle {
-                label: "faint".into(),
-                color: Rgba::layer_color(1),
-            },
-        ];
+        s.layers = vec![LayerStyle::new("bright", 0), LayerStyle::new("faint", 1)];
         let l = PlotLayout::compute(&s, 800.0, 600.0);
         assert_eq!(l.legend_labels.len(), 2);
         assert!(l.legend_box.width > 0.0);

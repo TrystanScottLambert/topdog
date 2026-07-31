@@ -43,10 +43,34 @@ impl Rgba {
 ///
 /// A plot always has at least one layer; the legend is drawn when there are
 /// two or more. Layer labels are click-to-edit like any other plot text.
+/// Every visual property is per-layer so overlaid subsamples can be styled
+/// apart (different markers, filled vs open, bar vs step histograms, ...).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerStyle {
     pub label: String,
     pub color: Rgba,
+    pub marker: MarkerShape,
+    pub marker_size: f32,
+    /// Filled markers, or outline-only ("open") markers.
+    pub filled: bool,
+    /// Stroke width for lines, step histograms, and open markers.
+    pub line_width: f32,
+    pub hist_style: HistStyle,
+}
+
+impl LayerStyle {
+    /// Defaults for the i-th layer: palette color, filled circles, bars.
+    pub fn new(label: impl Into<String>, i: usize) -> Self {
+        Self {
+            label: label.into(),
+            color: Rgba::layer_color(i),
+            marker: MarkerShape::Circle,
+            marker_size: 3.0,
+            filled: true,
+            line_width: 1.5,
+            hist_style: HistStyle::Bars,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +79,48 @@ pub enum MarkerShape {
     Square,
     Diamond,
     Cross,
+}
+
+impl MarkerShape {
+    pub const ALL: [MarkerShape; 4] = [
+        MarkerShape::Circle,
+        MarkerShape::Square,
+        MarkerShape::Diamond,
+        MarkerShape::Cross,
+    ];
+}
+
+impl std::fmt::Display for MarkerShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MarkerShape::Circle => write!(f, "● circle"),
+            MarkerShape::Square => write!(f, "■ square"),
+            MarkerShape::Diamond => write!(f, "◆ diamond"),
+            MarkerShape::Cross => write!(f, "✚ cross"),
+        }
+    }
+}
+
+/// How a histogram layer is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistStyle {
+    /// Filled bars with an outline.
+    Bars,
+    /// Outline only ("staircase"), the style used to overlay comparisons.
+    Steps,
+}
+
+impl HistStyle {
+    pub const ALL: [HistStyle; 2] = [HistStyle::Bars, HistStyle::Steps];
+}
+
+impl std::fmt::Display for HistStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HistStyle::Bars => write!(f, "bars"),
+            HistStyle::Steps => write!(f, "steps"),
+        }
+    }
 }
 
 /// One axis' user-editable state.
@@ -109,6 +175,14 @@ pub enum PlotKind {
         x_column: String,
         y_column: String,
         z_column: String,
+    },
+    /// Points on (or in) the celestial sphere: lon/lat in degrees, plus an
+    /// optional radial distance column. Without distance, points sit on the
+    /// unit sphere (TOPCAT's sphere view); with it, at their 3D positions.
+    Sphere {
+        lon_column: String,
+        lat_column: String,
+        dist_column: Option<String>,
     },
 }
 
@@ -217,6 +291,27 @@ impl PlotSpec {
                 projection,
             },
             marker_size: 2.0,
+            ..Self::base()
+        }
+    }
+
+    /// Celestial-sphere plot: lon/lat (degrees), optional radial distance.
+    pub fn sphere(
+        lon_column: impl Into<String>,
+        lat_column: impl Into<String>,
+        dist_column: Option<String>,
+    ) -> Self {
+        let lon_column = lon_column.into();
+        let lat_column = lat_column.into();
+        Self {
+            title: String::new(),
+            x_axis: Axis::new(lon_column.clone()),
+            y_axis: Axis::new(lat_column.clone()),
+            kind: PlotKind::Sphere {
+                lon_column,
+                lat_column,
+                dist_column,
+            },
             ..Self::base()
         }
     }

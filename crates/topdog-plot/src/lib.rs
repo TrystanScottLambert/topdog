@@ -24,4 +24,4 @@ pub use geometry::{PointF, RectF};
 pub use layout::{PlotLayout, TextElement};
 pub use projection::SkyProjection;
 pub use scale::LinearScale;
-pub use spec::{Axis, LayerStyle, MarkerShape, PlotKind, PlotSpec, Rgba};
+pub use spec::{Axis, HistStyle, LayerStyle, MarkerShape, PlotKind, PlotSpec, Rgba};

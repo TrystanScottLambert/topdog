@@ -1,22 +1,25 @@
 //! topdog desktop application.
 //!
-//! Tab-based UI: a Tables tab (browse loaded files, define subsets) and one
-//! tab per plot type, each exposing only the inputs that plot needs.
-//! Multiple parquet files can be open at once; any (table, subset) pair can
-//! be added as a layer to a plot, so subsamples overplot on shared axes
-//! with a legend. All data access goes through `topdog_core::DataTable`, so
-//! only the rows/aggregates a view needs are ever materialized.
+//! Tab-based UI: a Tables tab (browse loaded files, select rows, define
+//! subsets) and one tab per plot type, each with a sidebar exposing only the
+//! inputs that plot needs plus per-layer style editors. Multiple parquet
+//! files can be open at once; any (table, subset) pair can be added as a
+//! layer, so subsamples overplot on shared axes with a legend. All data
+//! access goes through `topdog_core::DataTable`, so only the rows/aggregates
+//! a view needs are ever materialized.
 
 mod plot;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, stack, text, text_input, Space,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, slider, stack,
+    text, text_input, Space,
 };
-use iced::{Element, Font, Length, Padding, Task};
-use topdog_core::{DataTable, RowWindow};
-use topdog_plot::{PlotSpec, RectF, SkyProjection, TextElement};
+use iced::{Background, Element, Font, Length, Padding, Task};
+use topdog_core::{BinSpec, DataTable, RowWindow};
+use topdog_plot::{HistStyle, MarkerShape, PlotSpec, RectF, Rgba, SkyProjection, TextElement};
 
 use plot::{EditState, PlotData, PlotMessage, PlotPane};
 
@@ -34,20 +37,20 @@ const REFETCH_MARGIN: usize = 20;
 /// Point budget per scatter layer; beyond this the fetch stride-downsamples
 /// (CLAUDE.md §4 — configurable in spirit; a settings UI can expose it later).
 const MAX_PLOT_POINTS: usize = 200_000;
-const DEFAULT_HIST_BINS: usize = 30;
-/// pick_list sentinel for "no error column".
+/// pick_list sentinel for "no column selected".
 const NONE_OPTION: &str = "(none)";
 /// widget id of the floating label editor, for focusing it on click.
 const EDIT_INPUT_ID: &str = "plot-edit";
+const SIDEBAR_WIDTH: f32 = 290.0;
 
 fn main() -> iced::Result {
     iced::application(TopDog::default, update, view)
         .title(title)
-        .window_size((1350.0, 800.0))
+        .window_size((1400.0, 850.0))
         .run()
 }
 
-/// The main tabs. `PLOTS` lists the plot tabs in strip order.
+/// The main tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Tables,
@@ -55,16 +58,18 @@ enum Tab {
     Line,
     Histogram,
     Sky,
+    Sphere,
     ThreeD,
 }
 
 impl Tab {
-    const ALL: [Tab; 6] = [
+    const ALL: [Tab; 7] = [
         Tab::Tables,
         Tab::Scatter,
         Tab::Line,
         Tab::Histogram,
         Tab::Sky,
+        Tab::Sphere,
         Tab::ThreeD,
     ];
 
@@ -75,6 +80,7 @@ impl Tab {
             Tab::Line => "Line",
             Tab::Histogram => "Histogram",
             Tab::Sky => "Sky",
+            Tab::Sphere => "Sphere",
             Tab::ThreeD => "3D",
         }
     }
@@ -87,7 +93,30 @@ impl Tab {
             Tab::Line => Some(1),
             Tab::Histogram => Some(2),
             Tab::Sky => Some(3),
-            Tab::ThreeD => Some(4),
+            Tab::Sphere => Some(4),
+            Tab::ThreeD => Some(5),
+        }
+    }
+}
+
+/// How the histogram tab derives its bins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinMode {
+    Auto,
+    Width,
+    Edges,
+}
+
+impl BinMode {
+    const ALL: [BinMode; 3] = [BinMode::Auto, BinMode::Width, BinMode::Edges];
+}
+
+impl std::fmt::Display for BinMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BinMode::Auto => write!(f, "bin count"),
+            BinMode::Width => write!(f, "bin width"),
+            BinMode::Edges => write!(f, "custom edges"),
         }
     }
 }
@@ -99,12 +128,12 @@ struct LoadedTable {
     subsets: Vec<SubsetEntry>,
 }
 
-/// A named subsample: filter expression applied to the base table. The
-/// filtered `DataTable` is a cheap lazy clone; its row count is already
-/// resolved.
+/// A named subsample. The filtered `DataTable` is a cheap lazy clone with
+/// its row count already resolved.
 struct SubsetEntry {
     name: String,
-    expr: String,
+    /// Human-readable definition (predicate, column list, or "n picked rows").
+    definition: String,
     table: DataTable,
 }
 
@@ -129,15 +158,20 @@ impl LoadedTable {
 }
 
 /// State of the Tables tab: which (table, subset) is being browsed, the
-/// virtualized view of it, and the new-subset form.
+/// virtualized view of it, row selection, and the new-subset form.
 #[derive(Default)]
 struct TablesTab {
     selected_table: usize,
     /// 0 = all rows, i = subsets[i-1].
     selected_subset: usize,
     view: Option<TableView>,
+    /// Selected row indices (stable within the browsed table); cleared when
+    /// the browse target changes.
+    selection: HashSet<u64>,
     new_name: String,
     new_expr: String,
+    /// Comma-separated column names for the subset; empty = all columns.
+    new_cols: String,
     creating: bool,
     error: Option<String>,
 }
@@ -160,6 +194,7 @@ impl TableView {
             window: RowWindow {
                 offset: 0,
                 rows: Vec::new(),
+                indices: Vec::new(),
             },
             first_visible: 0,
             rows_in_view: 40,
@@ -179,7 +214,13 @@ struct PlotTab {
     z: Option<String>,
     x_err: Option<String>,
     y_err: Option<String>,
+    /// Sphere tab: optional radial distance column.
+    dist: Option<String>,
     log_bins: bool,
+    bin_mode: BinMode,
+    n_bins_text: String,
+    width_text: String,
+    edges_text: String,
     projection: SkyProjection,
     pane: Option<PlotPane>,
     loading: bool,
@@ -196,7 +237,12 @@ impl PlotTab {
             z: None,
             x_err: None,
             y_err: None,
+            dist: None,
             log_bins: false,
+            bin_mode: BinMode::Auto,
+            n_bins_text: "30".to_string(),
+            width_text: String::new(),
+            edges_text: String::new(),
             projection: SkyProjection::Aitoff,
             pane: None,
             loading: false,
@@ -208,7 +254,7 @@ struct TopDog {
     tables: Vec<LoadedTable>,
     active: Tab,
     tables_tab: TablesTab,
-    plots: [PlotTab; 5],
+    plots: [PlotTab; 6],
     loading: bool,
     error: Option<String>,
 }
@@ -224,6 +270,7 @@ impl Default for TopDog {
                 PlotTab::new(Tab::Line),
                 PlotTab::new(Tab::Histogram),
                 PlotTab::new(Tab::Sky),
+                PlotTab::new(Tab::Sphere),
                 PlotTab::new(Tab::ThreeD),
             ],
             loading: false,
@@ -239,6 +286,17 @@ impl TopDog {
     }
 }
 
+/// A change to one layer's style, applied straight onto `spec.layers[i]`.
+#[derive(Debug, Clone, Copy)]
+enum StyleChange {
+    Color(usize),
+    Shape(MarkerShape),
+    Filled(bool),
+    Size(f32),
+    LineWidth(f32),
+    Hist(HistStyle),
+}
+
 /// Inputs on a plot tab (routed with the tab so every tab keeps its own).
 #[derive(Debug, Clone)]
 enum PlotInput {
@@ -249,8 +307,14 @@ enum PlotInput {
     PickZ(String),
     PickXErr(String),
     PickYErr(String),
+    PickDist(String),
     ToggleLogBins(bool),
+    PickBinMode(BinMode),
+    NBinsChanged(String),
+    WidthChanged(String),
+    EdgesChanged(String),
     PickProjection(SkyProjection),
+    Style { layer: usize, change: StyleChange },
     AddLayer,
     RemoveLayer(usize),
     ClearLayers,
@@ -271,9 +335,13 @@ enum Message {
         generation: u64,
         result: Box<Result<RowWindow, String>>,
     },
+    RowToggled(u64),
+    ClearSelection,
     SubsetNameChanged(String),
     SubsetExprChanged(String),
+    SubsetColsChanged(String),
     CreateSubset,
+    CreateSubsetFromSelection,
     SubsetCreated(Box<Result<(usize, String, String, DataTable), String>>),
     DeleteSubset(usize),
     // Plot tabs
@@ -403,6 +471,16 @@ fn update(state: &mut TopDog, message: Message) -> Task<Message> {
                 }
             }
         }
+        Message::RowToggled(ix) => {
+            if !state.tables_tab.selection.remove(&ix) {
+                state.tables_tab.selection.insert(ix);
+            }
+            Task::none()
+        }
+        Message::ClearSelection => {
+            state.tables_tab.selection.clear();
+            Task::none()
+        }
         Message::SubsetNameChanged(s) => {
             state.tables_tab.new_name = s;
             Task::none()
@@ -411,25 +489,75 @@ fn update(state: &mut TopDog, message: Message) -> Task<Message> {
             state.tables_tab.new_expr = s;
             Task::none()
         }
+        Message::SubsetColsChanged(s) => {
+            state.tables_tab.new_cols = s;
+            Task::none()
+        }
         Message::CreateSubset => {
             let t = &state.tables_tab;
-            if t.creating || t.new_expr.trim().is_empty() || state.tables.is_empty() {
+            let expr = t.new_expr.trim().to_string();
+            let cols = parse_columns(&t.new_cols);
+            if t.creating || state.tables.is_empty() || (expr.is_empty() && cols.is_none()) {
                 return Task::none();
             }
             let table_ix = t.selected_table;
             let name = if t.new_name.trim().is_empty() {
-                t.new_expr.trim().to_string()
+                if expr.is_empty() {
+                    "column subset".to_string()
+                } else {
+                    expr.clone()
+                }
             } else {
                 t.new_name.trim().to_string()
             };
-            let expr = t.new_expr.trim().to_string();
+            let definition = if expr.is_empty() {
+                format!("columns: {}", t.new_cols.trim())
+            } else if cols.is_some() {
+                format!("{} | columns: {}", expr, t.new_cols.trim())
+            } else {
+                expr.clone()
+            };
             let base = state.tables[table_ix].base.clone();
             state.tables_tab.creating = true;
             state.tables_tab.error = None;
             Task::perform(
                 async move {
-                    base.subset(name.clone(), &expr)
-                        .map(|t| (table_ix, name, expr, t))
+                    let pred = (!expr.is_empty()).then_some(expr.as_str());
+                    base.subset(name.clone(), pred, cols.as_deref())
+                        .map(|t| (table_ix, name, definition, t))
+                        .map_err(|e| e.to_string())
+                },
+                |r| Message::SubsetCreated(Box::new(r)),
+            )
+        }
+        Message::CreateSubsetFromSelection => {
+            let t = &state.tables_tab;
+            if t.creating || t.selection.is_empty() {
+                return Task::none();
+            }
+            let Some(view) = &t.view else {
+                return Task::none();
+            };
+            let table_ix = t.selected_table;
+            let mut rows: Vec<u64> = t.selection.iter().copied().collect();
+            rows.sort_unstable();
+            let cols = parse_columns(&t.new_cols);
+            let name = if t.new_name.trim().is_empty() {
+                format!("{} picked rows", rows.len())
+            } else {
+                t.new_name.trim().to_string()
+            };
+            let definition = format!("{} hand-picked rows", rows.len());
+            // Selection is relative to the browsed table (which may itself
+            // be a subset) — chain from it, not from the base.
+            let source = view.table.clone();
+            state.tables_tab.creating = true;
+            state.tables_tab.error = None;
+            Task::perform(
+                async move {
+                    source
+                        .subset_from_rows(name.clone(), &rows, cols.as_deref())
+                        .map(|t| (table_ix, name, definition, t))
                         .map_err(|e| e.to_string())
                 },
                 |r| Message::SubsetCreated(Box::new(r)),
@@ -438,12 +566,18 @@ fn update(state: &mut TopDog, message: Message) -> Task<Message> {
         Message::SubsetCreated(result) => {
             state.tables_tab.creating = false;
             match *result {
-                Ok((table_ix, name, expr, table)) => {
+                Ok((table_ix, name, definition, table)) => {
                     if let Some(entry) = state.tables.get_mut(table_ix) {
-                        entry.subsets.push(SubsetEntry { name, expr, table });
+                        entry.subsets.push(SubsetEntry {
+                            name,
+                            definition,
+                            table,
+                        });
                     }
                     state.tables_tab.new_name.clear();
                     state.tables_tab.new_expr.clear();
+                    state.tables_tab.new_cols.clear();
+                    state.tables_tab.selection.clear();
                 }
                 Err(e) => state.tables_tab.error = Some(e),
             }
@@ -536,6 +670,16 @@ fn update(state: &mut TopDog, message: Message) -> Task<Message> {
     }
 }
 
+/// "a, b, c" -> Some(["a","b","c"]); empty/whitespace -> None (= all).
+fn parse_columns(s: &str) -> Option<Vec<String>> {
+    let cols: Vec<String> = s
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    (!cols.is_empty()).then_some(cols)
+}
+
 /// Handle an input on a plot tab.
 fn plot_input(state: &mut TopDog, tab: Tab, input: PlotInput) -> Task<Message> {
     let Some(ix) = tab.plot_index() else {
@@ -556,6 +700,7 @@ fn plot_input(state: &mut TopDog, tab: Tab, input: PlotInput) -> Task<Message> {
                 pt.z = cols.get(2).cloned();
                 pt.x_err = None;
                 pt.y_err = None;
+                pt.dist = None;
             }
             Task::none()
         }
@@ -583,12 +728,48 @@ fn plot_input(state: &mut TopDog, tab: Tab, input: PlotInput) -> Task<Message> {
             pt.y_err = (c != NONE_OPTION).then_some(c);
             Task::none()
         }
+        PlotInput::PickDist(c) => {
+            pt.dist = (c != NONE_OPTION).then_some(c);
+            Task::none()
+        }
         PlotInput::ToggleLogBins(v) => {
             pt.log_bins = v;
             Task::none()
         }
+        PlotInput::PickBinMode(m) => {
+            pt.bin_mode = m;
+            Task::none()
+        }
+        PlotInput::NBinsChanged(s) => {
+            pt.n_bins_text = s;
+            Task::none()
+        }
+        PlotInput::WidthChanged(s) => {
+            pt.width_text = s;
+            Task::none()
+        }
+        PlotInput::EdgesChanged(s) => {
+            pt.edges_text = s;
+            Task::none()
+        }
         PlotInput::PickProjection(p) => {
             pt.projection = p;
+            Task::none()
+        }
+        PlotInput::Style { layer, change } => {
+            if let Some(pane) = &mut pt.pane {
+                if let Some(style) = pane.spec.layers.get_mut(layer) {
+                    match change {
+                        StyleChange::Color(i) => style.color = Rgba::layer_color(i),
+                        StyleChange::Shape(s) => style.marker = s,
+                        StyleChange::Filled(f) => style.filled = f,
+                        StyleChange::Size(s) => style.marker_size = s,
+                        StyleChange::LineWidth(w) => style.line_width = w,
+                        StyleChange::Hist(h) => style.hist_style = h,
+                    }
+                    pane.cache.clear();
+                }
+            }
             Task::none()
         }
         PlotInput::RemoveLayer(i) => {
@@ -635,19 +816,32 @@ fn plot_input(state: &mut TopDog, tab: Tab, input: PlotInput) -> Task<Message> {
                     )),
                     _ => None,
                 },
-                Tab::Histogram => pt.x.clone().map(|x| {
-                    (
-                        PlotSpec::histogram(x.clone(), DEFAULT_HIST_BINS, pt.log_bins),
-                        LayerJob::Histogram {
-                            column: x,
-                            log_bins: pt.log_bins,
-                        },
-                    )
-                }),
+                Tab::Histogram => match (pt.x.clone(), parse_bins(pt)) {
+                    (Some(x), Ok(bins)) => Some((
+                        PlotSpec::histogram(x.clone(), 0, pt.log_bins),
+                        LayerJob::Histogram { column: x, bins },
+                    )),
+                    (_, Err(e)) => {
+                        state.error = Some(e);
+                        return Task::none();
+                    }
+                    _ => None,
+                },
                 Tab::Sky => match (pt.x.clone(), pt.y.clone()) {
                     (Some(lon), Some(lat)) => Some((
                         PlotSpec::sky(lon.clone(), lat.clone(), pt.projection),
                         LayerJob::Sky { lon, lat },
+                    )),
+                    _ => None,
+                },
+                Tab::Sphere => match (pt.x.clone(), pt.y.clone()) {
+                    (Some(lon), Some(lat)) => Some((
+                        PlotSpec::sphere(lon.clone(), lat.clone(), pt.dist.clone()),
+                        LayerJob::Sphere {
+                            lon,
+                            lat,
+                            dist: pt.dist.clone(),
+                        },
                     )),
                     _ => None,
                 },
@@ -679,6 +873,45 @@ fn plot_input(state: &mut TopDog, tab: Tab, input: PlotInput) -> Task<Message> {
     }
 }
 
+/// Build the histogram `BinSpec` from the tab's inputs.
+fn parse_bins(pt: &PlotTab) -> Result<BinSpec, String> {
+    match pt.bin_mode {
+        BinMode::Auto => {
+            let n: usize = pt
+                .n_bins_text
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad bin count: {:?}", pt.n_bins_text))?;
+            if n == 0 || n > 100_000 {
+                return Err("bin count must be between 1 and 100000".to_string());
+            }
+            Ok(BinSpec::Count {
+                n,
+                log: pt.log_bins,
+            })
+        }
+        BinMode::Width => {
+            let w: f64 = pt
+                .width_text
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad bin width: {:?}", pt.width_text))?;
+            Ok(BinSpec::Width(w))
+        }
+        BinMode::Edges => {
+            let edges: Result<Vec<f64>, _> = pt
+                .edges_text
+                .split(',')
+                .map(|s| s.trim().parse::<f64>())
+                .collect();
+            let edges = edges.map_err(|_| {
+                "bin edges must be comma-separated numbers, e.g. 0, 0.5, 1, 2".to_string()
+            })?;
+            Ok(BinSpec::Edges(edges))
+        }
+    }
+}
+
 /// The data fetch for one layer, run on a background task.
 enum LayerJob {
     Scatter {
@@ -693,11 +926,16 @@ enum LayerJob {
     },
     Histogram {
         column: String,
-        log_bins: bool,
+        bins: BinSpec,
     },
     Sky {
         lon: String,
         lat: String,
+    },
+    Sphere {
+        lon: String,
+        lat: String,
+        dist: Option<String>,
     },
     Xyz {
         x: String,
@@ -713,12 +951,21 @@ impl LayerJob {
                 .scatter_data(x, y, x_err.as_deref(), y_err.as_deref(), MAX_PLOT_POINTS)
                 .map(PlotData::Scatter),
             LayerJob::Line { x, y } => table.line_data(x, y, MAX_PLOT_POINTS).map(PlotData::Line),
-            LayerJob::Histogram { column, log_bins } => table
-                .histogram(column, DEFAULT_HIST_BINS, *log_bins)
-                .map(PlotData::Histogram),
+            LayerJob::Histogram { column, bins } => {
+                table.histogram(column, bins).map(PlotData::Histogram)
+            }
             LayerJob::Sky { lon, lat } => table
                 .scatter_data(lon, lat, None, None, MAX_PLOT_POINTS)
                 .map(PlotData::Sky),
+            LayerJob::Sphere { lon, lat, dist } => {
+                let mut names: Vec<&str> = vec![lon, lat];
+                if let Some(d) = dist {
+                    names.push(d);
+                }
+                table
+                    .columns_data(&names, MAX_PLOT_POINTS)
+                    .map(PlotData::Sphere)
+            }
             LayerJob::Xyz { x, y, z } => table
                 .columns_data(&[x, y, z], MAX_PLOT_POINTS)
                 .map(PlotData::Xyz),
@@ -744,6 +991,7 @@ fn rebuild_browse(state: &mut TopDog) -> Task<Message> {
     view.generation = generation;
     let task = fetch_task(&mut view);
     state.tables_tab.view = Some(view);
+    state.tables_tab.selection.clear();
     task
 }
 
@@ -874,10 +1122,16 @@ fn view(state: &TopDog) -> Element<'_, Message> {
     column![toolbar, tabs, content].into()
 }
 
-/// Tables tab: sidebar (tables, subsets, new-subset form) + virtualized view.
+/// Small labelled section header for sidebars.
+fn section(label: &'static str) -> Element<'static, Message> {
+    text(label).size(14).into()
+}
+
+/// Tables tab: sidebar (tables, subsets, selection, new-subset form) +
+/// virtualized, row-selectable table view.
 fn tables_tab(state: &TopDog) -> Element<'_, Message> {
     let t = &state.tables_tab;
-    let mut sidebar = column![text("Tables").size(14)].spacing(6);
+    let mut sidebar = column![section("Tables")].spacing(6);
 
     for (i, entry) in state.tables.iter().enumerate() {
         let style = if i == t.selected_table {
@@ -902,7 +1156,7 @@ fn tables_tab(state: &TopDog) -> Element<'_, Message> {
 
     if let Some(entry) = state.tables.get(t.selected_table) {
         sidebar = sidebar.push(Space::new().height(10));
-        sidebar = sidebar.push(text(format!("Subsets of {}", entry.base.name())).size(14));
+        sidebar = sidebar.push(section("Subsets"));
 
         let all_style = if t.selected_subset == 0 {
             button::primary
@@ -933,7 +1187,7 @@ fn tables_tab(state: &TopDog) -> Element<'_, Message> {
             );
             // The defining expression, dimmed, so subsets stay auditable.
             sidebar = sidebar.push(
-                text(sub.expr.clone())
+                text(sub.definition.clone())
                     .size(11)
                     .font(Font::MONOSPACE)
                     .style(text::secondary),
@@ -941,36 +1195,58 @@ fn tables_tab(state: &TopDog) -> Element<'_, Message> {
         }
 
         sidebar = sidebar.push(Space::new().height(10));
-        sidebar = sidebar.push(text("New subset").size(14));
+        sidebar = sidebar.push(section("New subset"));
         sidebar = sidebar.push(
             text_input("name", &t.new_name)
                 .on_input(Message::SubsetNameChanged)
                 .size(13),
         );
         sidebar = sidebar.push(
-            text_input("e.g. mag < 20 AND dec > 0", &t.new_expr)
+            text_input("filter, e.g. mag < 20 AND dec > 0", &t.new_expr)
                 .on_input(Message::SubsetExprChanged)
                 .on_submit(Message::CreateSubset)
                 .size(13),
         );
-        let add: Element<'_, Message> = if t.creating {
-            text("creating…").size(13).into()
+        sidebar = sidebar.push(
+            text_input("columns, e.g. ra, dec, mag (empty = all)", &t.new_cols)
+                .on_input(Message::SubsetColsChanged)
+                .size(13),
+        );
+        if t.creating {
+            sidebar = sidebar.push(text("creating…").size(13));
         } else {
-            button(text("Add subset").size(13))
-                .on_press(Message::CreateSubset)
-                .into()
-        };
-        sidebar = sidebar.push(add);
+            let n_sel = t.selection.len();
+            let from_sel = (n_sel > 0).then_some(Message::CreateSubsetFromSelection);
+            sidebar = sidebar.push(
+                row![
+                    button(text("From filter").size(13)).on_press(Message::CreateSubset),
+                    button(text(format!("From {n_sel} selected")).size(13))
+                        .on_press_maybe(from_sel),
+                ]
+                .spacing(4),
+            );
+            if n_sel > 0 {
+                sidebar = sidebar.push(
+                    button(text("clear selection").size(12)).on_press(Message::ClearSelection),
+                );
+            } else {
+                sidebar = sidebar.push(
+                    text("click rows in the table to select them")
+                        .size(11)
+                        .style(text::secondary),
+                );
+            }
+        }
         if let Some(err) = &t.error {
             sidebar = sidebar.push(text(err).size(12).style(text::danger));
         }
     }
 
-    let sidebar =
-        container(scrollable(sidebar.padding(8)).height(Length::Fill)).width(Length::Fixed(280.0));
+    let sidebar = container(scrollable(sidebar.padding(8)).height(Length::Fill))
+        .width(Length::Fixed(SIDEBAR_WIDTH));
 
     let table_area: Element<'_, Message> = match &t.view {
-        Some(view) => table_view(view),
+        Some(view) => table_view(view, &t.selection),
         None => container(text("No table selected").size(14))
             .center(Length::Fill)
             .into(),
@@ -979,7 +1255,8 @@ fn tables_tab(state: &TopDog) -> Element<'_, Message> {
     row![sidebar, table_area].spacing(6).into()
 }
 
-/// A plot tab: kind-specific inputs, layer chips, canvas.
+/// A plot tab: sidebar with kind-specific inputs + per-layer style editors,
+/// canvas on the right.
 fn plot_tab_view<'a>(state: &'a TopDog, pt: &'a PlotTab) -> Element<'a, Message> {
     let tab = pt.tab;
     let msg = move |input: PlotInput| Message::PlotInput { tab, input };
@@ -987,6 +1264,8 @@ fn plot_tab_view<'a>(state: &'a TopDog, pt: &'a PlotTab) -> Element<'a, Message>
     let table_ix = pt.table_ix.min(state.tables.len() - 1);
     let entry = &state.tables[table_ix];
     let cols = entry.numeric_columns.clone();
+    let mut optional_cols = vec![NONE_OPTION.to_string()];
+    optional_cols.extend(cols.iter().cloned());
 
     let table_options: Vec<String> = state
         .tables
@@ -999,92 +1278,151 @@ fn plot_tab_view<'a>(state: &'a TopDog, pt: &'a PlotTab) -> Element<'a, Message>
         .collect();
     let subset_ix = pt.subset_ix.min(entry.subsets.len());
 
-    let mut inputs = row![
-        pick_list(
-            table_options,
-            Some(table_option(table_ix, entry)),
-            move |s| msg(PlotInput::PickTable(s))
-        )
-        .text_size(13),
-        pick_list(
-            subset_options,
-            Some(subset_option(subset_ix, entry)),
-            move |s| msg(PlotInput::PickSubset(s))
-        )
-        .text_size(13),
-    ]
-    .spacing(8)
-    .align_y(iced::Alignment::Center);
-
+    let labelled = |label: &'static str, el: Element<'a, Message>| -> Element<'a, Message> {
+        row![text(label).size(13).width(Length::Fixed(52.0)), el]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .into()
+    };
     let col_pick = |label: &'static str,
                     selected: &Option<String>,
                     to_input: fn(String) -> PlotInput|
      -> Element<'a, Message> {
-        row![
-            text(label).size(13),
+        labelled(
+            label,
             pick_list(cols.clone(), selected.clone(), move |s| msg(to_input(s)))
                 .placeholder("column")
-                .text_size(13),
-        ]
-        .spacing(4)
-        .align_y(iced::Alignment::Center)
-        .into()
+                .text_size(13)
+                .width(Length::Fill)
+                .into(),
+        )
     };
+    let opt_pick = |label: &'static str,
+                    selected: &Option<String>,
+                    to_input: fn(String) -> PlotInput|
+     -> Element<'a, Message> {
+        labelled(
+            label,
+            pick_list(
+                optional_cols.clone(),
+                Some(selected.clone().unwrap_or_else(|| NONE_OPTION.to_string())),
+                move |s| msg(to_input(s)),
+            )
+            .text_size(13)
+            .width(Length::Fill)
+            .into(),
+        )
+    };
+
+    let mut sidebar = column![
+        section("Data"),
+        labelled(
+            "table",
+            pick_list(
+                table_options,
+                Some(table_option(table_ix, entry)),
+                move |s| msg(PlotInput::PickTable(s))
+            )
+            .text_size(13)
+            .width(Length::Fill)
+            .into()
+        ),
+        labelled(
+            "subset",
+            pick_list(
+                subset_options,
+                Some(subset_option(subset_ix, entry)),
+                move |s| msg(PlotInput::PickSubset(s))
+            )
+            .text_size(13)
+            .width(Length::Fill)
+            .into()
+        ),
+    ]
+    .spacing(6);
 
     match tab {
         Tab::Scatter => {
-            let mut err_options = vec![NONE_OPTION.to_string()];
-            err_options.extend(cols.iter().cloned());
-            inputs = inputs
+            sidebar = sidebar
                 .push(col_pick("x", &pt.x, PlotInput::PickX))
                 .push(col_pick("y", &pt.y, PlotInput::PickY))
-                .push(text("±x").size(13))
-                .push(
-                    pick_list(
-                        err_options.clone(),
-                        Some(pt.x_err.clone().unwrap_or_else(|| NONE_OPTION.to_string())),
-                        move |s| msg(PlotInput::PickXErr(s)),
-                    )
-                    .text_size(13),
-                )
-                .push(text("±y").size(13))
-                .push(
-                    pick_list(
-                        err_options,
-                        Some(pt.y_err.clone().unwrap_or_else(|| NONE_OPTION.to_string())),
-                        move |s| msg(PlotInput::PickYErr(s)),
-                    )
-                    .text_size(13),
-                );
+                .push(opt_pick("x error", &pt.x_err, PlotInput::PickXErr))
+                .push(opt_pick("y error", &pt.y_err, PlotInput::PickYErr));
         }
         Tab::Line => {
-            inputs = inputs
+            sidebar = sidebar
                 .push(col_pick("x", &pt.x, PlotInput::PickX))
                 .push(col_pick("y", &pt.y, PlotInput::PickY));
         }
         Tab::Histogram => {
-            inputs = inputs
-                .push(col_pick("column", &pt.x, PlotInput::PickX))
-                .push(
-                    checkbox(pt.log_bins)
-                        .label("log bins")
-                        .on_toggle(move |v| msg(PlotInput::ToggleLogBins(v)))
-                        .text_size(13),
-                );
+            sidebar = sidebar.push(col_pick("column", &pt.x, PlotInput::PickX));
+            sidebar = sidebar.push(labelled(
+                "bins",
+                pick_list(BinMode::ALL, Some(pt.bin_mode), move |m| {
+                    msg(PlotInput::PickBinMode(m))
+                })
+                .text_size(13)
+                .width(Length::Fill)
+                .into(),
+            ));
+            match pt.bin_mode {
+                BinMode::Auto => {
+                    sidebar = sidebar.push(labelled(
+                        "count",
+                        text_input("30", &pt.n_bins_text)
+                            .on_input(move |s| msg(PlotInput::NBinsChanged(s)))
+                            .size(13)
+                            .into(),
+                    ));
+                    sidebar = sidebar.push(
+                        checkbox(pt.log_bins)
+                            .label("log-spaced bins")
+                            .on_toggle(move |v| msg(PlotInput::ToggleLogBins(v)))
+                            .text_size(13),
+                    );
+                }
+                BinMode::Width => {
+                    sidebar = sidebar.push(labelled(
+                        "width",
+                        text_input("e.g. 0.5", &pt.width_text)
+                            .on_input(move |s| msg(PlotInput::WidthChanged(s)))
+                            .size(13)
+                            .into(),
+                    ));
+                }
+                BinMode::Edges => {
+                    sidebar = sidebar.push(labelled(
+                        "edges",
+                        text_input("e.g. 0, 0.5, 1, 2, 5", &pt.edges_text)
+                            .on_input(move |s| msg(PlotInput::EdgesChanged(s)))
+                            .size(13)
+                            .into(),
+                    ));
+                }
+            }
         }
         Tab::Sky => {
-            inputs = inputs
-                .push(col_pick("lon", &pt.x, PlotInput::PickX))
-                .push(col_pick("lat", &pt.y, PlotInput::PickY))
-                .push(
+            sidebar = sidebar
+                .push(col_pick("lon (RA)", &pt.x, PlotInput::PickX))
+                .push(col_pick("lat (Dec)", &pt.y, PlotInput::PickY))
+                .push(labelled(
+                    "proj",
                     pick_list(SkyProjection::ALL, Some(pt.projection), move |p| {
                         msg(PlotInput::PickProjection(p))
                     })
-                    .text_size(13),
-                );
+                    .text_size(13)
+                    .width(Length::Fill)
+                    .into(),
+                ));
+        }
+        Tab::Sphere => {
+            sidebar = sidebar
+                .push(col_pick("lon (RA)", &pt.x, PlotInput::PickX))
+                .push(col_pick("lat (Dec)", &pt.y, PlotInput::PickY))
+                .push(opt_pick("distance", &pt.dist, PlotInput::PickDist));
         }
         Tab::ThreeD => {
-            inputs = inputs
+            sidebar = sidebar
                 .push(col_pick("x", &pt.x, PlotInput::PickX))
                 .push(col_pick("y", &pt.y, PlotInput::PickY))
                 .push(col_pick("z", &pt.z, PlotInput::PickZ));
@@ -1098,34 +1436,26 @@ fn plot_tab_view<'a>(state: &'a TopDog, pt: &'a PlotTab) -> Element<'a, Message>
             Tab::ThreeD => pt.x.is_some() && pt.y.is_some() && pt.z.is_some(),
             _ => pt.x.is_some() && pt.y.is_some(),
         };
-    inputs = inputs.push(
+    sidebar = sidebar.push(
         button(text(if pt.loading { "adding…" } else { "Add layer" }).size(13))
             .on_press_maybe(can_add.then(|| msg(PlotInput::AddLayer))),
     );
 
-    // Layer chips: label + remove button per layer, and a clear-all.
-    let mut chips = row![].spacing(6).align_y(iced::Alignment::Center);
     if let Some(pane) = &pt.pane {
+        sidebar = sidebar.push(Space::new().height(10));
+        sidebar = sidebar.push(section("Layers"));
         for (i, layer) in pane.spec.layers.iter().enumerate() {
-            chips = chips.push(
-                row![
-                    text(format!("■ {}", layer.label)).size(12).style({
-                        let c = layer.color;
-                        move |_: &iced::Theme| text::Style {
-                            color: Some(iced::Color::from_rgba(c.r, c.g, c.b, c.a)),
-                        }
-                    }),
-                    button(text("✕").size(10)).on_press(msg(PlotInput::RemoveLayer(i))),
-                ]
-                .spacing(2)
-                .align_y(iced::Alignment::Center),
-            );
+            sidebar = sidebar.push(layer_editor(tab, i, layer));
         }
         if !pane.spec.layers.is_empty() {
-            chips =
-                chips.push(button(text("clear").size(12)).on_press(msg(PlotInput::ClearLayers)));
+            sidebar = sidebar.push(
+                button(text("clear all layers").size(12)).on_press(msg(PlotInput::ClearLayers)),
+            );
         }
     }
+
+    let sidebar = container(scrollable(sidebar.padding(8)).height(Length::Fill))
+        .width(Length::Fixed(SIDEBAR_WIDTH));
 
     let canvas_area: Element<'a, Message> = match &pt.pane {
         Some(pane) => match &pane.editing {
@@ -1137,22 +1467,106 @@ fn plot_tab_view<'a>(state: &'a TopDog, pt: &'a PlotTab) -> Element<'a, Message>
             .into(),
     };
 
-    column![
-        inputs.padding(Padding {
-            top: 0.0,
-            bottom: 4.0,
-            left: 8.0,
-            right: 8.0,
+    row![sidebar, canvas_area].spacing(6).into()
+}
+
+/// Style controls for one layer: color palette, shape/fill for point plots,
+/// widths and bin style where they apply.
+fn layer_editor(tab: Tab, i: usize, layer: &topdog_plot::LayerStyle) -> Element<'_, Message> {
+    let msg = move |change: StyleChange| Message::PlotInput {
+        tab,
+        input: PlotInput::Style { layer: i, change },
+    };
+
+    let mut editor = column![row![
+        text(format!("■ {}", layer.label)).size(12).style({
+            let c = layer.color;
+            move |_: &iced::Theme| text::Style {
+                color: Some(iced::Color::from_rgba(c.r, c.g, c.b, c.a)),
+            }
         }),
-        chips.padding(Padding {
-            top: 0.0,
-            bottom: 4.0,
-            left: 8.0,
-            right: 8.0,
+        Space::new().width(Length::Fill),
+        button(text("✕").size(10)).on_press(Message::PlotInput {
+            tab,
+            input: PlotInput::RemoveLayer(i)
         }),
-        canvas_area,
     ]
-    .into()
+    .align_y(iced::Alignment::Center)]
+    .spacing(4);
+
+    // Color swatches from the shared palette.
+    editor = editor.push(
+        row(Rgba::PALETTE.iter().enumerate().map(|(ci, c)| {
+            let color = iced::Color::from_rgba(c.r, c.g, c.b, c.a);
+            button(Space::new().width(14).height(14))
+                .style(move |_theme: &iced::Theme, _status| button::Style {
+                    background: Some(Background::Color(color)),
+                    ..button::Style::default()
+                })
+                .on_press(msg(StyleChange::Color(ci)))
+                .into()
+        }))
+        .spacing(4),
+    );
+
+    let uses_markers = matches!(tab, Tab::Scatter | Tab::Sky | Tab::Sphere | Tab::ThreeD);
+    if uses_markers {
+        editor = editor.push(
+            row![
+                pick_list(MarkerShape::ALL, Some(layer.marker), move |s| msg(
+                    StyleChange::Shape(s)
+                ))
+                .text_size(12)
+                .width(Length::Fill),
+                checkbox(layer.filled)
+                    .label("filled")
+                    .on_toggle(move |f| msg(StyleChange::Filled(f)))
+                    .text_size(12),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+        editor = editor.push(
+            row![
+                text(format!("size {:.1}", layer.marker_size)).size(12),
+                slider(0.5..=12.0, layer.marker_size, move |v| msg(
+                    StyleChange::Size(v)
+                ))
+                .step(0.5_f32),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    let uses_lines = matches!(tab, Tab::Line | Tab::Histogram) || (uses_markers && !layer.filled);
+    if uses_lines {
+        editor = editor.push(
+            row![
+                text(format!("line {:.1}", layer.line_width)).size(12),
+                slider(0.5..=8.0, layer.line_width, move |v| msg(
+                    StyleChange::LineWidth(v)
+                ))
+                .step(0.5_f32),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    if tab == Tab::Histogram {
+        editor = editor.push(
+            pick_list(HistStyle::ALL, Some(layer.hist_style), move |h| {
+                msg(StyleChange::Hist(h))
+            })
+            .text_size(12)
+            .width(Length::Fill),
+        );
+    }
+
+    container(editor)
+        .padding(6)
+        .width(Length::Fill)
+        .style(container::bordered_box)
+        .into()
 }
 
 fn edit_overlay<'a>(pane: &'a PlotPane, edit: &'a EditState) -> Element<'a, Message> {
@@ -1185,7 +1599,8 @@ fn edit_overlay<'a>(pane: &'a PlotPane, edit: &'a EditState) -> Element<'a, Mess
 
 /// Header row + virtualized body. Both live inside one horizontal scrollable
 /// so the header stays vertically pinned but scrolls sideways with the data.
-fn table_view(view: &TableView) -> Element<'_, Message> {
+/// Rows are clickable to toggle selection (highlighted).
+fn table_view<'a>(view: &'a TableView, selection: &HashSet<u64>) -> Element<'a, Message> {
     let header = row(view.table.columns().iter().map(|c| {
         let marker = match view.table.sort_spec() {
             Some(s) if s.column == c.name && s.descending => " ▼",
@@ -1220,7 +1635,15 @@ fn table_view(view: &TableView) -> Element<'_, Message> {
 
     let rows_col = column(
         std::iter::once(Space::new().height(top_pad).into())
-            .chain(window.rows.iter().map(|r| data_row(r, &numeric)))
+            .chain(
+                window
+                    .rows
+                    .iter()
+                    .zip(window.indices.iter())
+                    .map(|(r, &base_ix)| {
+                        data_row(r, &numeric, base_ix, selection.contains(&base_ix))
+                    }),
+            )
             .chain(std::iter::once(Space::new().height(bottom_pad).into())),
     );
 
@@ -1239,8 +1662,13 @@ fn table_view(view: &TableView) -> Element<'_, Message> {
         .into()
 }
 
-fn data_row<'a>(cells: &'a [String], numeric: &[bool]) -> Element<'a, Message> {
-    row(cells.iter().zip(numeric).map(|(value, &is_num)| {
+fn data_row<'a>(
+    cells: &'a [String],
+    numeric: &[bool],
+    base_ix: u64,
+    selected: bool,
+) -> Element<'a, Message> {
+    let content = row(cells.iter().zip(numeric).map(|(value, &is_num)| {
         text(value)
             .size(CELL_TEXT_SIZE)
             .font(Font::MONOSPACE)
@@ -1252,6 +1680,22 @@ fn data_row<'a>(cells: &'a [String], numeric: &[bool]) -> Element<'a, Message> {
             })
             .into()
     }))
-    .height(Length::Fixed(ROW_HEIGHT))
-    .into()
+    .height(Length::Fixed(ROW_HEIGHT));
+
+    let styled = container(content).style(move |theme: &iced::Theme| {
+        if selected {
+            container::Style {
+                background: Some(Background::Color(
+                    theme.extended_palette().primary.weak.color,
+                )),
+                ..container::Style::default()
+            }
+        } else {
+            container::Style::default()
+        }
+    });
+
+    mouse_area(styled)
+        .on_press(Message::RowToggled(base_ix))
+        .into()
 }

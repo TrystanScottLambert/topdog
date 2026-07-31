@@ -14,7 +14,7 @@ mod table;
 
 pub use column::ColumnMeta;
 pub use error::CoreError;
-pub use plotdata::{ColumnsData, Histogram, ScatterData};
+pub use plotdata::{BinSpec, ColumnsData, Histogram, ScatterData};
 pub use stats::ColumnStats;
 pub use table::{DataTable, RowWindow, SortSpec};
 

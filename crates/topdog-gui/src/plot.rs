@@ -12,8 +12,10 @@ use iced::widget::canvas::{self, Canvas, Event, Path, Stroke, Text};
 use iced::{Color, Element, Length, Point, Rectangle, Size};
 use topdog_core::{ColumnsData, Histogram, ScatterData};
 use topdog_plot::{
+    projection::{sky_to_xyz, sphere_wireframe},
     scale::{self, LinearScale},
-    MarkerShape, PlotKind, PlotLayout, PlotSpec, PointF, RectF, Rgba, SkyProjection, TextElement,
+    HistStyle, LayerStyle, MarkerShape, PlotKind, PlotLayout, PlotSpec, PointF, RectF, Rgba,
+    SkyProjection, TextElement,
 };
 
 use crate::Message;
@@ -29,6 +31,8 @@ pub enum PlotData {
     Sky(ScatterData),
     /// columns[0..3] = x, y, z.
     Xyz(ColumnsData),
+    /// columns = [lon (deg), lat (deg)] or [lon, lat, distance].
+    Sphere(ColumnsData),
 }
 
 /// View state of the 3D camera. Deliberately not part of `PlotSpec`:
@@ -93,10 +97,8 @@ impl PlotPane {
     }
 
     pub fn add_layer(&mut self, label: String, data: PlotData) {
-        let color = Rgba::layer_color(self.spec.layers.len());
-        self.spec
-            .layers
-            .push(topdog_plot::LayerStyle { label, color });
+        let style = LayerStyle::new(label, self.spec.layers.len());
+        self.spec.layers.push(style);
         self.layers.push(data);
         self.cache.clear();
     }
@@ -175,7 +177,10 @@ impl canvas::Program<Message> for PlotProgram<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
-        let is_3d = matches!(self.pane.spec.kind, PlotKind::Scatter3D { .. });
+        let is_3d = matches!(
+            self.pane.spec.kind,
+            PlotKind::Scatter3D { .. } | PlotKind::Sphere { .. }
+        );
 
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
@@ -264,7 +269,10 @@ impl canvas::Program<Message> for PlotProgram<'_> {
             if layout.hit_test(PointF { x: pos.x, y: pos.y }).is_some() {
                 return mouse::Interaction::Pointer;
             }
-            if matches!(self.pane.spec.kind, PlotKind::Scatter3D { .. }) {
+            if matches!(
+                self.pane.spec.kind,
+                PlotKind::Scatter3D { .. } | PlotKind::Sphere { .. }
+            ) {
                 return mouse::Interaction::Grab;
             }
         }
@@ -276,12 +284,13 @@ fn color(c: Rgba) -> Color {
     Color::from_rgba(c.r, c.g, c.b, c.a)
 }
 
-/// Color for the i-th layer (spec style, falling back to marker_color).
-fn layer_color(spec: &PlotSpec, i: usize) -> Color {
+/// Style of the i-th layer (owned default if the spec has none, which only
+/// happens transiently before the first layer lands).
+fn layer_style(spec: &PlotSpec, i: usize) -> LayerStyle {
     spec.layers
         .get(i)
-        .map(|l| color(l.color))
-        .unwrap_or_else(|| color(spec.marker_color))
+        .cloned()
+        .unwrap_or_else(|| LayerStyle::new("", i))
 }
 
 const FRAME_COLOR: Color = Color::BLACK;
@@ -316,13 +325,15 @@ fn draw_plot(
         draw_axes(frame, spec, &layout, &x_scale, &y_scale);
 
         for (i, data) in layers.iter().enumerate() {
-            let lc = layer_color(spec, i);
+            let style = layer_style(spec, i);
             match data {
                 PlotData::Scatter(points) => {
-                    draw_scatter(frame, spec, points, lc, &x_scale, &y_scale)
+                    draw_scatter(frame, &style, points, &x_scale, &y_scale)
                 }
-                PlotData::Histogram(hist) => draw_histogram(frame, hist, lc, &x_scale, &y_scale),
-                PlotData::Line(points) => draw_line(frame, spec, points, lc, &x_scale, &y_scale),
+                PlotData::Histogram(hist) => {
+                    draw_histogram(frame, &style, hist, &x_scale, &y_scale)
+                }
+                PlotData::Line(points) => draw_line(frame, &style, points, &x_scale, &y_scale),
                 _ => {}
             }
         }
@@ -331,6 +342,7 @@ fn draw_plot(
         match &spec.kind {
             PlotKind::Sky { projection, .. } => draw_sky(frame, spec, layers, *projection, &layout),
             PlotKind::Scatter3D { .. } => draw_3d(frame, spec, layers, camera, &layout),
+            PlotKind::Sphere { .. } => draw_sphere(frame, spec, layers, camera, &layout),
             _ => {}
         }
     }
@@ -455,16 +467,16 @@ fn draw_axes(
 
 fn draw_scatter(
     frame: &mut canvas::Frame,
-    spec: &PlotSpec,
+    style: &LayerStyle,
     points: &ScatterData,
-    mc: Color,
     x_scale: &LinearScale,
     y_scale: &LinearScale,
 ) {
+    let mc = color(style.color);
     let err_stroke = Stroke::default().with_width(1.0).with_color(mc);
     let (x0, x1) = x_scale.domain;
     let (y0, y1) = y_scale.domain;
-    let r = spec.marker_size;
+    let r = style.marker_size;
 
     for i in 0..points.x.len() {
         let (dx, dy) = (points.x[i], points.y[i]);
@@ -504,19 +516,21 @@ fn draw_scatter(
             );
         }
 
-        draw_marker(frame, p, r, spec.marker_shape, mc);
+        draw_marker(frame, p, style, mc);
     }
 }
 
 fn draw_line(
     frame: &mut canvas::Frame,
-    spec: &PlotSpec,
+    style: &LayerStyle,
     points: &ScatterData,
-    mc: Color,
     x_scale: &LinearScale,
     y_scale: &LinearScale,
 ) {
-    let stroke = Stroke::default().with_width(spec.line_width).with_color(mc);
+    let mc = color(style.color);
+    let stroke = Stroke::default()
+        .with_width(style.line_width)
+        .with_color(mc);
 
     // One polyline through all points in (pre-sorted) x order.
     let mut first = true;
@@ -535,16 +549,6 @@ fn draw_line(
         }
     });
     frame.stroke(&path, stroke);
-
-    if spec.line_markers {
-        for i in 0..points.x.len() {
-            let p = Point::new(
-                x_scale.to_screen(points.x[i]),
-                y_scale.to_screen(points.y[i]),
-            );
-            draw_marker(frame, p, spec.marker_size, spec.marker_shape, mc);
-        }
-    }
 }
 
 fn draw_sky(
@@ -618,7 +622,8 @@ fn draw_sky(
         let Some(points) = scatter_like(data) else {
             continue;
         };
-        let mc = layer_color(spec, i);
+        let style = layer_style(spec, i);
+        let mc = color(style.color);
         for j in 0..points.x.len() {
             let lon = points.x[j];
             let lat = points.y[j];
@@ -628,13 +633,7 @@ fn draw_sky(
             // Wrap RA into [0, 360), then center.
             let lon = lon.rem_euclid(360.0);
             let (px, py) = projection.project((lon - 180.0) * deg, lat * deg);
-            draw_marker(
-                frame,
-                to_screen(px, py),
-                spec.marker_size,
-                spec.marker_shape,
-                mc,
-            );
+            draw_marker(frame, to_screen(px, py), &style, mc);
         }
     }
 
@@ -737,12 +736,12 @@ fn draw_3d(
         }
     }
 
-    let r = spec.marker_size * 0.8;
     for (i, data) in layers.iter().enumerate() {
         let PlotData::Xyz(points) = data else {
             continue;
         };
-        let mc = layer_color(spec, i);
+        let style = layer_style(spec, i);
+        let mc = color(style.color);
         let (xs, ys, zs) = (&points.columns[0], &points.columns[1], &points.columns[2]);
         for j in 0..xs.len() {
             let p = project(
@@ -750,7 +749,119 @@ fn draw_3d(
                 norm(ys[j], ranges[1]),
                 norm(zs[j], ranges[2]),
             );
-            frame.fill(&Path::circle(p, r), mc);
+            draw_marker(frame, p, &style, mc);
+        }
+    }
+
+    downsample_note(frame, spec, layers, pa);
+    annotation(
+        frame,
+        spec,
+        "drag rotate · right-drag pan · scroll zoom".to_string(),
+        Point::new(pa.x + pa.width - 4.0, pa.y + pa.height - 14.0),
+    );
+}
+
+/// Celestial sphere: points at (lon, lat[, distance]) inside a wireframe
+/// sphere, seen through the shared 3D camera. Far-hemisphere points are
+/// faded so the front of the sky reads clearly.
+fn draw_sphere(
+    frame: &mut canvas::Frame,
+    spec: &PlotSpec,
+    layers: &[PlotData],
+    camera: &Camera3D,
+    layout: &PlotLayout,
+) {
+    let pa = layout.plot_area;
+    let scale_px = camera.zoom * pa.width.min(pa.height) * 0.45;
+    let cx = pa.x + pa.width / 2.0 + camera.pan.0;
+    let cy = pa.y + pa.height / 2.0 + camera.pan.1;
+    let (syaw, cyaw) = camera.yaw.sin_cos();
+    let (sp, cp) = camera.pitch.sin_cos();
+
+    // Same orthographic camera as the 3D cube, but returning depth so the
+    // far hemisphere can be faded (positive depth = away from the viewer).
+    let project = |x: f64, y: f64, z: f64| -> (Point, f32) {
+        let (x, y, z) = (x as f32, y as f32, z as f32);
+        let x1 = x * cyaw - y * syaw;
+        let y1 = x * syaw + y * cyaw;
+        let depth = y1 * cp - z * sp;
+        let z2 = y1 * sp + z * cp;
+        (Point::new(cx + x1 * scale_px, cy - z2 * scale_px), depth)
+    };
+
+    // Radial scale: unit sphere unless distances are present, then the
+    // largest distance across all layers touches the wireframe.
+    let mut dmax = f64::NEG_INFINITY;
+    for data in layers {
+        if let PlotData::Sphere(points) = data {
+            if let Some(dist) = points.columns.get(2) {
+                let (_, hi) = min_max(dist);
+                dmax = dmax.max(hi);
+            }
+        }
+    }
+    let has_dist = dmax.is_finite() && dmax > 0.0;
+
+    let grat = Stroke::default()
+        .with_width(1.0)
+        .with_color(GRATICULE_COLOR);
+    for line in sphere_wireframe(30.0, 30.0, 48) {
+        let path = Path::new(|b| {
+            for (i, &(x, y, z)) in line.iter().enumerate() {
+                let (p, _) = project(x, y, z);
+                if i == 0 {
+                    b.move_to(p);
+                } else {
+                    b.line_to(p);
+                }
+            }
+        });
+        frame.stroke(&path, grat);
+    }
+
+    // Pole labels orient the viewer.
+    for (label, lat) in [("N", 90.0), ("S", -90.0)] {
+        let (x, y, z) = sky_to_xyz(0.0, lat, 1.1);
+        let (p, _) = project(x, y, z);
+        frame.fill_text(Text {
+            content: label.to_string(),
+            position: p,
+            color: ANNOTATION_COLOR,
+            size: spec.tick_label_size.into(),
+            align_x: iced::widget::text::Alignment::Center,
+            align_y: iced::alignment::Vertical::Center,
+            ..Text::default()
+        });
+    }
+
+    for (i, data) in layers.iter().enumerate() {
+        let PlotData::Sphere(points) = data else {
+            continue;
+        };
+        let style = layer_style(spec, i);
+        let mc = color(style.color);
+        let faded = Color {
+            a: mc.a * 0.25,
+            ..mc
+        };
+        let (lons, lats) = (&points.columns[0], &points.columns[1]);
+        let dists = points.columns.get(2);
+        for j in 0..lons.len() {
+            let lat = lats[j];
+            if !(-90.0..=90.0).contains(&lat) {
+                continue;
+            }
+            let r = match (has_dist, dists) {
+                (true, Some(d)) => d[j] / dmax,
+                _ => 1.0,
+            };
+            if !(0.0..=1.0).contains(&r) {
+                continue; // negative distances have no home on this plot
+            }
+            let (x, y, z) = sky_to_xyz(lons[j].rem_euclid(360.0), lat, r);
+            let (p, depth) = project(x, y, z);
+            draw_marker(frame, p, &style, if depth > 0.0 { faded } else { mc });
         }
     }
 
@@ -781,7 +892,7 @@ fn downsample_note(frame: &mut canvas::Frame, spec: &PlotSpec, layers: &[PlotDat
         .iter()
         .filter_map(|d| match d {
             PlotData::Scatter(p) | PlotData::Line(p) | PlotData::Sky(p) => Some(p.stride),
-            PlotData::Xyz(p) => Some(p.stride),
+            PlotData::Xyz(p) | PlotData::Sphere(p) => Some(p.stride),
             PlotData::Histogram(_) => None,
         })
         .max()
@@ -801,14 +912,31 @@ fn downsample_note(frame: &mut canvas::Frame, spec: &PlotSpec, layers: &[PlotDat
     }
 }
 
-fn draw_marker(frame: &mut canvas::Frame, p: Point, r: f32, shape: MarkerShape, color: Color) {
-    match shape {
-        MarkerShape::Circle => frame.fill(&Path::circle(p, r), color),
-        MarkerShape::Square => frame.fill_rectangle(
-            Point::new(p.x - r, p.y - r),
-            Size::new(2.0 * r, 2.0 * r),
-            color,
-        ),
+/// Draw one marker per the layer style (shape, size, filled/open) in the
+/// given color (callers may override the style color, e.g. depth fading).
+fn draw_marker(frame: &mut canvas::Frame, p: Point, style: &LayerStyle, color: Color) {
+    let r = style.marker_size;
+    let open = Stroke::default()
+        .with_width(style.line_width.max(1.0))
+        .with_color(color);
+    match style.marker {
+        MarkerShape::Circle => {
+            let path = Path::circle(p, r);
+            if style.filled {
+                frame.fill(&path, color);
+            } else {
+                frame.stroke(&path, open);
+            }
+        }
+        MarkerShape::Square => {
+            let corner = Point::new(p.x - r, p.y - r);
+            let size = Size::new(2.0 * r, 2.0 * r);
+            if style.filled {
+                frame.fill_rectangle(corner, size, color);
+            } else {
+                frame.stroke_rectangle(corner, size, open);
+            }
+        }
         MarkerShape::Diamond => {
             let path = Path::new(|b| {
                 b.move_to(Point::new(p.x, p.y - r * 1.3));
@@ -817,10 +945,17 @@ fn draw_marker(frame: &mut canvas::Frame, p: Point, r: f32, shape: MarkerShape, 
                 b.line_to(Point::new(p.x - r * 1.3, p.y));
                 b.close();
             });
-            frame.fill(&path, color);
+            if style.filled {
+                frame.fill(&path, color);
+            } else {
+                frame.stroke(&path, open);
+            }
         }
+        // A cross has no interior: filled/open draw identically.
         MarkerShape::Cross => {
-            let stroke = Stroke::default().with_width(1.5).with_color(color);
+            let stroke = Stroke::default()
+                .with_width(style.line_width.max(1.5))
+                .with_color(color);
             frame.stroke(
                 &Path::line(Point::new(p.x - r, p.y), Point::new(p.x + r, p.y)),
                 stroke,
@@ -835,33 +970,60 @@ fn draw_marker(frame: &mut canvas::Frame, p: Point, r: f32, shape: MarkerShape, 
 
 fn draw_histogram(
     frame: &mut canvas::Frame,
+    style: &LayerStyle,
     hist: &Histogram,
-    mc: Color,
     x_scale: &LinearScale,
     y_scale: &LinearScale,
 ) {
-    // Translucent so overlaid layer histograms stay readable.
-    let fill = Color { a: 0.55, ..mc };
-    let outline = Stroke::default().with_width(1.0).with_color(mc);
+    let mc = color(style.color);
+    let outline = Stroke::default()
+        .with_width(style.line_width)
+        .with_color(mc);
     let base = y_scale.to_screen(0.0);
 
-    for (i, &count) in hist.counts.iter().enumerate() {
-        if count == 0 {
-            continue;
+    match style.hist_style {
+        HistStyle::Bars => {
+            // Translucent so overlaid layer histograms stay readable.
+            let fill = Color { a: 0.55, ..mc };
+            for (i, &count) in hist.counts.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                let left = x_scale.to_screen(hist.edges[i]);
+                let right = x_scale.to_screen(hist.edges[i + 1]);
+                let top = y_scale.to_screen(count as f64);
+                frame.fill_rectangle(
+                    Point::new(left, top),
+                    Size::new(right - left, base - top),
+                    fill,
+                );
+                frame.stroke_rectangle(
+                    Point::new(left, top),
+                    Size::new(right - left, base - top),
+                    outline,
+                );
+            }
         }
-        let left = x_scale.to_screen(hist.edges[i]);
-        let right = x_scale.to_screen(hist.edges[i + 1]);
-        let top = y_scale.to_screen(count as f64);
-        frame.fill_rectangle(
-            Point::new(left, top),
-            Size::new(right - left, base - top),
-            fill,
-        );
-        frame.stroke_rectangle(
-            Point::new(left, top),
-            Size::new(right - left, base - top),
-            outline,
-        );
+        HistStyle::Steps => {
+            // One staircase outline: up the left side of each bin, across
+            // the top, down at each level change, closing to zero at the
+            // ends. Zero-count bins draw at the baseline.
+            let path = Path::new(|b| {
+                b.move_to(Point::new(x_scale.to_screen(hist.edges[0]), base));
+                for (i, &count) in hist.counts.iter().enumerate() {
+                    let left = x_scale.to_screen(hist.edges[i]);
+                    let right = x_scale.to_screen(hist.edges[i + 1]);
+                    let top = y_scale.to_screen(count as f64);
+                    b.line_to(Point::new(left, top));
+                    b.line_to(Point::new(right, top));
+                }
+                b.line_to(Point::new(
+                    x_scale.to_screen(hist.edges[hist.counts.len()]),
+                    base,
+                ));
+            });
+            frame.stroke(&path, outline);
+        }
     }
 }
 

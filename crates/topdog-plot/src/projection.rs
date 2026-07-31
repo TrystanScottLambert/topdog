@@ -117,6 +117,51 @@ impl SkyProjection {
     }
 }
 
+/// Convert (lon, lat) degrees and radius into 3D cartesian coordinates
+/// (x toward lon=0 on the equator, z toward the north pole).
+pub fn sky_to_xyz(lon_deg: f64, lat_deg: f64, r: f64) -> (f64, f64, f64) {
+    let deg = std::f64::consts::PI / 180.0;
+    let (lon, lat) = (lon_deg * deg, lat_deg * deg);
+    (
+        r * lat.cos() * lon.cos(),
+        r * lat.cos() * lon.sin(),
+        r * lat.sin(),
+    )
+}
+
+/// Wireframe of the unit sphere as 3D polylines: meridians every
+/// `lon_step`° and parallels every `lat_step`°. The GUI projects these
+/// through the same camera as the data points.
+pub fn sphere_wireframe(lon_step: f64, lat_step: f64, samples: usize) -> Vec<Vec<(f64, f64, f64)>> {
+    let mut lines = Vec::new();
+
+    let mut lon = 0.0;
+    while lon < 360.0 - 1e-9 {
+        let line: Vec<_> = (0..=samples)
+            .map(|i| {
+                let lat = -90.0 + 180.0 * i as f64 / samples as f64;
+                sky_to_xyz(lon, lat, 1.0)
+            })
+            .collect();
+        lines.push(line);
+        lon += lon_step;
+    }
+
+    let mut lat = -90.0 + lat_step;
+    while lat < 90.0 - 1e-9 {
+        let line: Vec<_> = (0..=samples)
+            .map(|i| {
+                let l = 360.0 * i as f64 / samples as f64;
+                sky_to_xyz(l, lat, 1.0)
+            })
+            .collect();
+        lines.push(line);
+        lat += lat_step;
+    }
+
+    lines
+}
+
 impl std::fmt::Display for SkyProjection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -197,6 +242,29 @@ mod tests {
         // meridians: -150..150 step 30 = 11; parallels: -60..60 step 30 = 5
         assert_eq!(lines.len(), 11 + 5);
         assert!(lines.iter().all(|l| l.len() > 10));
+    }
+
+    #[test]
+    fn sky_to_xyz_hits_cardinal_points() {
+        let (x, y, z) = sky_to_xyz(0.0, 0.0, 1.0);
+        assert!((x - 1.0).abs() < 1e-12 && y.abs() < 1e-12 && z.abs() < 1e-12);
+        let (_, _, z) = sky_to_xyz(123.0, 90.0, 2.0);
+        assert!((z - 2.0).abs() < 1e-12);
+        let (x, y, _) = sky_to_xyz(90.0, 0.0, 1.0);
+        assert!(x.abs() < 1e-12 && (y - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sphere_wireframe_points_are_unit_length() {
+        let lines = sphere_wireframe(30.0, 30.0, 24);
+        // 12 meridians + 5 parallels.
+        assert_eq!(lines.len(), 12 + 5);
+        for line in &lines {
+            for &(x, y, z) in line {
+                let r = (x * x + y * y + z * z).sqrt();
+                assert!((r - 1.0).abs() < 1e-9);
+            }
+        }
     }
 
     #[test]
