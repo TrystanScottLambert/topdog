@@ -1,0 +1,10 @@
+[package]
+name = "topdog-plot"
+description = "Plot math and data model for topdog: PlotSpec, scale/tick generation, layout geometry. Deliberately dependency-free"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

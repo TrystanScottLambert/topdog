@@ -92,6 +92,16 @@ The `topdog-gui` binary is the product; `topdog-cli` is a convenience for testin
 - Changing any `PlotSpec` field triggers a redraw only (never a full data re-scan) unless the change affects what data is needed (e.g. new binning resolution, new column selected for an axis).
 - Export renders the same `PlotSpec` + data through an SVG/PDF backend so exported figures match on-screen exactly — don't build a second rendering path.
 
+## 5a. Decisions made during implementation (keep current)
+
+- **Tabbed UI.** The main window is a tab strip: `Tables | Scatter | Line | Histogram | Sky | 3D`. Each plot tab exposes only the inputs that plot type needs (histogram: one column + binning; sky: lon/lat + projection; 3D: x/y/z; etc.). The table browser lives in the Tables tab, not permanently on screen.
+- **Multiple tables.** Any number of parquet files can be open at once (`TopDog::tables`). Opening a file appends; nothing is a singleton.
+- **Subsets (subsamples).** A subset is a named filter over a base table, typed as a SQL predicate (`mag < 20 AND dec > 0`) and parsed with `polars::sql::sql_expr` (polars `sql` feature). Core: `DataTable::subset(name, predicate)` returns a cheap filtered lazy clone with resolved row count. Subsets are created/deleted in the Tables tab sidebar and are browsable like tables.
+- **Plot layers.** A plot is 1..N layers, each bound to a (table, subset) plus columns, drawn in order with palette colors (`Rgba::PALETTE`, Paul Tol bright). `PlotSpec.layers: Vec<LayerStyle>` styles them; the GUI holds parallel `Vec<PlotData>`. A legend appears at 2+ layers; legend entry labels are click-to-edit like all plot text (`TextElement::Legend(i)`).
+- **Layer data is a snapshot.** Fetched when the layer is added; editing/deleting a subset later does not re-fetch existing layers.
+- **3D camera state** (yaw/pitch/zoom/pan) lives in the GUI pane, not `PlotSpec` — orientation is interaction state, not figure appearance.
+- **Plots draw on white regardless of app theme** so the on-screen figure matches the future exported (paper) version.
+
 ## 6. Suggested build order (phases)
 
 Work in this order; get each phase compiling, tested, and demoable before moving to the next. Don't jump ahead to plotting polish while parquet loading is still flaky.

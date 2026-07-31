@@ -1,0 +1,12 @@
+[package]
+name = "topdog-core"
+description = "Core data engine for topdog: lazy DataTable abstraction, column metadata, and streamed statistics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polars = { workspace = true }
+thiserror = { workspace = true }

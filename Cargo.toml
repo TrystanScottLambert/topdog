@@ -1,14 +1,37 @@
-[package]
-name = "topdog"
+[workspace]
+resolver = "2"
+members = [
+    "crates/topdog-core",
+    "crates/topdog-io",
+    "crates/topdog-plot",
+    "crates/topdog-gui",
+]
+
+[workspace.package]
 version = "0.0.1"
-edition = "2024"
-readme = "README.md"
-description = "Modern replacement for topcat"
+edition = "2021"
 authors = ["Trystan Lambert <trystan.lambert@uwa.edu.au>"]
 license = "MIT"
 repository = "https://github.com/TrystanScottLambert/topdog"
 
-[dependencies]
-iced = "0.14.0"
-polars = { version = "0.54.4", features = ["lazy", "parquet", "strings"] }
+[workspace.dependencies]
+topdog-core = { path = "crates/topdog-core" }
+topdog-io = { path = "crates/topdog-io" }
+topdog-plot = { path = "crates/topdog-plot" }
+polars = { version = "0.54.4", features = [
+    "lazy",
+    "parquet",
+    "strings",
+    "log",          # Expr::log for log-binned histograms
+    "round_series", # Expr::floor/clip for histogram bin indices
+    "sql",          # sql_expr: parse user-typed subset predicates
+] }
+thiserror = "2"
+anyhow = "1"
+iced = { version = "0.14.0", features = ["canvas"] }
 rfd = "0.17.2"
+
+# GUI apps are compiled with some optimization even in dev builds so that
+# polars scans and iced rendering stay interactive while developing.
+[profile.dev.package."*"]
+opt-level = 2

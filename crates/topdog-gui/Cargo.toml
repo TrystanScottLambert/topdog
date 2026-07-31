@@ -1,0 +1,20 @@
+[package]
+name = "topdog-gui"
+description = "The topdog desktop application: table browser and (soon) interactive plotting"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "topdog"
+path = "src/main.rs"
+
+[dependencies]
+topdog-core = { workspace = true }
+topdog-io = { workspace = true }
+topdog-plot = { workspace = true }
+iced = { workspace = true }
+rfd = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "topdog-io"
+description = "Table readers/writers for topdog. Parquet now, FITS in phase 2, all behind the TableSource trait"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+topdog-core = { workspace = true }
+polars = { workspace = true }
+thiserror = { workspace = true }
